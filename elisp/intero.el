@@ -1089,11 +1089,14 @@ If PROMPT-OPTIONS is non-nil, prompt with an options list."
               (intero-localize-path (intero-buffer-file-name)))))
       (let ((process
              (get-buffer-process
-              (apply #'make-comint-in-buffer "intero" (current-buffer) "stack" nil "ghci"
-                     (append arguments
-                             (list "--verbosity" "silent")
-                             (list "--ghci-options"
-                                   (concat "-ghci-script=" script)))))))
+              (apply #'make-comint-in-buffer "intero" (current-buffer) "nix-shell" nil
+                     (list (intero-shell-nix-path)
+                           "--run"
+                           (mapconcat 'identity
+                                      (append (list "cabal" "repl" )
+                                              arguments
+                                              (list "--ghc-option" (concat "-ghci-script=" script)))
+                                      " "))))))
         (when (process-live-p process)
           (set-process-query-on-exit-flag process nil)
           (message "Started Intero process for REPL.")
@@ -1379,7 +1382,7 @@ project."
   (let* ((intero-absolute-project-root
           (intero-extend-path-by-buffer-host (intero-project-root)))
          (temporary-file-directory
-          (expand-file-name ".stack-work/intero/"
+          (expand-file-name "dist/intero/"
                             intero-absolute-project-root)))
     temporary-file-directory))
 
@@ -1593,6 +1596,20 @@ Completions for PREFIX are passed to CONT in SOURCE-BUFFER."
   (let ((process-args (append (list program infile destination display) args)))
     (apply 'process-file process-args)))
 
+(defun in-nix-shell (program &optional infile destination display
+                             &rest args)
+  "Execute with nix-shell."
+  (let ((command (mapconcat 'identity
+                            (cons program args)
+                            " ")))
+    (intero-call-process "nix-shell"
+                         infile
+                         destination
+                         display
+                         (intero-shell-nix-path)
+                         "--run"
+                         command)))
+
 (defun intero-delete-worker (worker)
   "Delete the given WORKER."
   (when (intero-buffer-p worker)
@@ -1654,60 +1671,15 @@ If provided, use the specified TARGETS and SOURCE-BUFFER."
       (let ((install-status (intero-installed-p)))
         (if (eq install-status 'installed)
             (intero-start-process-in-buffer buffer targets source-buffer)
-          (intero-auto-install buffer install-status targets source-buffer))))))
+          (intero-report-install-fail buffer install-status targets source-buffer))))))
 
-(defun intero-auto-install (buffer install-status &optional targets source-buffer)
-  "Automatically install Intero appropriately for BUFFER.
-INSTALL-STATUS indicates the current installation status.
-If supplied, use the given TARGETS and SOURCE-BUFFER."
-  (if (buffer-local-value 'intero-give-up buffer)
-      buffer
-    (let ((source-buffer (or source-buffer (current-buffer))))
-      (switch-to-buffer buffer)
-      (erase-buffer)
-      (insert (cl-case install-status
-                (not-installed "Intero is not installed in the Stack environment.")
-                (wrong-version "The wrong version of Intero is installed for this Emacs package."))
-              (format "
-
-Installing intero-%s automatically ...
-
-" intero-package-version))
-      (redisplay)
-      (cl-case (intero-call-process
-                "stack" nil (current-buffer) t "build"
-                (with-current-buffer buffer
-                  (let* ((cabal-file (intero-cabal-find-file))
-                         (package-name (intero-package-name cabal-file)))
-                    ;; For local development. Most users'll
-                    ;; never hit this behaviour.
-                    (if (string= package-name "intero")
-                        "intero"
-                      (concat "intero-" intero-package-version))))
-                "ghc-paths" "syb")
-        (0
-         (message "Installed successfully! Starting Intero in a moment ...")
-         (bury-buffer buffer)
-         (switch-to-buffer source-buffer)
-         (intero-start-process-in-buffer buffer targets source-buffer))
-        (1
-         (with-current-buffer buffer (setq-local intero-give-up t))
-         (insert (propertize "Could not install Intero!
-
-We don't know why it failed. Please read the above output and try
-installing manually. If that doesn't work, report this as a
-problem.
-
-WHAT TO DO NEXT
-
-If you don't want to Intero to try installing itself again for
-this project, just keep this buffer around in your Emacs.
-
-If you'd like to try again next time you try use an Intero
-feature, kill this buffer.
-"
-                             'face 'compilation-error))
-         nil)))))
+(defun intero-report-install-fail (buffer install-status &optional targets source-buffer)
+  "Report if no usable intero is present"
+  (switch-to-buffer buffer)
+  (erase-buffer)
+  (insert (cl-case install-status
+            (not-installed "Intero is not installed in the Stack environment.")
+            (wrong-version "The wrong version of Intero is installed for this Emacs package."))))
 
 (defun intero-start-process-in-buffer (buffer &optional targets source-buffer)
   "Start an Intero worker in BUFFER, for the default or specified TARGETS.
@@ -1724,13 +1696,14 @@ Automatically performs initial actions in SOURCE-BUFFER, if specified."
              t ;; pass --no-load to stack
              t ;; pass -ignore-dot-ghci to intero
              ))
-           (arguments (cons "ghci" options))
+           (arguments (cons "repl" options))
            (process (with-current-buffer buffer
                       (when intero-debug
                         (message "Intero arguments: %s" (combine-and-quote-strings arguments)))
                       (message "Booting up intero ...")
-                      (apply #'start-file-process "stack" buffer "stack"
-                             arguments))))
+                      (apply #'start-file-process "nix-shell" buffer "nix-shell"
+                             (list (intero-shell-nix-path) "--run"
+                                   (mapconcat 'identity (cons "cabal" arguments) " "))))))
       (set-process-query-on-exit-flag process nil)
       (process-send-string process ":set -fobject-code\n")
       (process-send-string process ":set prompt \"\\4\"\n")
@@ -1796,18 +1769,13 @@ TARGETS are the build targets.  When non-nil, NO-BUILD and
 NO-LOAD enable the correspondingly-named stack options."
   (append (list "--with-ghc"
                 "intero"
-                "--docker-run-args=--interactive=true --tty=false"
                 )
-          (when no-build
-            (list "--no-build"))
-          (when no-load
-            (list "--no-load"))
           (when ignore-dot-ghci
-            (list "--ghci-options" "-ignore-dot-ghci"))
+            (list "--ghc-option" "-ignore-dot-ghci"))
           (let ((dir (intero-localize-path (intero-make-temp-file "intero" t))))
-            (list "--ghci-options"
+            (list "--ghc-option"
                   (concat "-odir=" dir)
-                  "--ghci-options"
+                  "--ghc-option"
                   (concat "-hidir=" dir)))
           targets))
 
@@ -1840,16 +1808,15 @@ This is a standard process sentinel function."
   "Return non-nil if intero (of the right version) is installed in the stack environment."
   (redisplay)
   (with-temp-buffer
-    (if (= 0 (intero-call-process "stack" nil t nil "exec"
-                                  "--verbosity" "silent"
-                                  "--" "intero" "--version"))
+    (if (= 0 (in-nix-shell "intero" nil t nil "--version"))
         (progn
           (goto-char (point-min))
           ;; This skipping comes due to https://github.com/commercialhaskell/intero/pull/216/files
           (when (looking-at "Intero ")
             (goto-char (match-end 0)))
           ;;
-          (if (string= (buffer-substring (point) (line-end-position))
+          (if (string= (buffer-substring (point)
+                                         (line-end-position))
                        intero-package-version)
               'installed
             'wrong-version))
@@ -1972,29 +1939,16 @@ this project, or the global one if no such project-specific
 config exists."
   (if intero-project-root
       intero-project-root
-    (setq intero-project-root
-          (with-temp-buffer
-            (cl-case (save-excursion
-                       (intero-call-process "stack" nil
-                                            (current-buffer)
-                                            nil
-                                            "path"
-                                            "--project-root"
-                                            "--verbosity" "silent"))
-              (0 (buffer-substring (line-beginning-position) (line-end-position)))
-              (t (intero--warn "Couldn't get the Stack project root.
+    (setq intero-project-root (let ((cabal-file (intero-cabal-find-file)))
+                                (if cabal-file
+                                    (directory-file-name (file-name-directory cabal-file))
+                                  (intero--warn "Couldn't get a project root."))))))
 
-This can be caused by a syntax error in your stack.yaml file. Check that out.
+(defun intero-shell-nix-path ()
+  "Get the projects shell.nix path."
+  (concat (intero-project-root)
+          "/shell.nix"))
 
-If you do not wish to use Intero for some projects, see
-https://github.com/commercialhaskell/intero#whitelistingblacklisting-projects
-
-Otherwise, please report this as a bug!
-
-For debugging purposes, try running the following in your terminal:
-
-stack path --project-root")
-                 nil))))))
 
 (defun intero-ghc-version ()
   "Get the GHC version used by the project."
@@ -2003,7 +1957,7 @@ stack path --project-root")
         (setq intero-ghc-version
               (with-temp-buffer
                 (cl-case (save-excursion
-                           (intero-call-process "stack" nil (current-buffer) t "ghc" "--" "--numeric-version"))
+                           (in-nix-shell "ghc" nil (current-buffer) t "--numeric-version"))
                   (0
                    (buffer-substring (line-beginning-position) (line-end-position)))
                   (1 nil)))))))
@@ -2409,7 +2363,10 @@ suggestions are available."
         (setq intero-extensions
               (split-string
                (shell-command-to-string
-                "stack exec --verbosity silent -- ghc --supported-extensions"))))))
+                (mapconcat
+                 'identity
+                 (list "nix-shell" (intero-shell-nix-path) "--run" "\"ghc --supported-extensions\"")
+                 " ")))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Auto actions
