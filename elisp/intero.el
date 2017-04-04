@@ -1964,14 +1964,19 @@ config exists."
 
 (defun intero-get-targets ()
   "Get all available targets."
-  (with-temp-buffer
-    (cl-case (intero-call-process "stack" nil (current-buffer) t "ide" "targets")
-      (0
-       (cl-remove-if-not
-        (lambda (line)
-          (string-match "^[A-Za-z0-9-:]+$" line))
-        (split-string (buffer-string) "[\r\n]" t)))
-      (1 nil))))
+  (let ((cabal-file (intero-cabal-find-file)))
+    (with-temp-buffer
+      (insert-file-contents-literally cabal-file)
+      (mapcar (apply-partially 'replace-regexp-in-string
+                               "^executable[[:space:]]+\\([A-Za-z0-9-]+\\)[[:space:]]*$"
+                               (concat "exe:" "\\1"))
+              (mapcar (apply-partially 'replace-regexp-in-string "^library[[:space:]]*$"
+                                       (concat "lib:" (intero-package-name cabal-file)))
+                      (cl-remove-if-not
+                       (apply-partially
+                        'string-match-p
+                        "^\\(library\\|executable[[:space:]]+[A-Za-z0-9-]+\\)[[:space:]]*$")
+                       (split-string (buffer-string) "[\r\n]" t)))))))
 
 (defun intero-package-name (&optional cabal-file)
   "Get the current package name from a nearby .cabal file.
